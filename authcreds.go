@@ -103,7 +103,6 @@ func auth(url string, secret []byte) {
 		jsonbody := string(body)
 		BearerToken.Store("Bearer " + gjson.Get(jsonbody, "access_token").Str)
 		expiry = gjson.Get(jsonbody, "expires_in").Int()
-		log.Printf("Token: %v\nExpires in: %v", BearerToken, expiry)
 		d := time.Duration(expiry)
 		time.Sleep(d * time.Second)
 	}
@@ -138,7 +137,6 @@ func auth2(url string, secret []byte) {
 		jsonbody := string(body)
 		BearerToken.Store("Bearer " + gjson.Get(jsonbody, "access_token").Str)
 		expiry = gjson.Get(jsonbody, "expires_in").Int()
-		log.Printf("Token: %v\nExpires in: %v", BearerToken, expiry)
 		d := time.Duration(expiry)
 		time.Sleep(d * time.Second)
 	}
