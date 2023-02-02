@@ -20,71 +20,104 @@ import (
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 )
 
+type Secret struct {
+	BearerToken   atomic.String
+	APIToken      atomic.String
+	token         []byte
+	url           string
+	SecretID      string
+	SecretVersion string
+	TokenType     string
+	TokenField    string
+}
+
 var (
 	BearerToken    atomic.String
 	MailCreds      atomic.String
+	Keyring        []Secret
 	secretCache, _ = secretcache.New()
 )
 
-func AuthLoad() {
+func AuthLoad() error {
 	var secret0ID string
-	var secret0Version string
 	var secret1ID string
-	var secret1Version string
 	var projectID string
-	var url string
-	_, e := os.Stat("./conf.env")
-	if os.IsNotExist(e) {
-		err := generateVarsFile()
-		if err != nil {
-			log.Fatal(err)
+
+	if s := os.Getenv("SECRET_STORE"); s == "" {
+		_, e := os.Stat("./conf.env")
+		if os.IsNotExist(e) {
+			err := generateVarsFile()
+			if err != nil {
+				return fmt.Errorf("authcreds package: error generating conf.env: %v", err)
+			}
+			return fmt.Errorf("authcreds package: missing conf.env file and required envvars not defined")
 		}
-		log.Println("authcreds package: missing conf.env file")
-		os.Exit(1)
+		err := godotenv.Load("./conf.env")
+		if err != nil {
+			return fmt.Errorf("error loading .env file and required envvars not defined: %v", err)
+		}
 	}
-	err := godotenv.Load("./conf.env")
-	if err != nil {
-		log.Fatal("error loading .env file")
-	}
+
 	secretLocation := os.Getenv("SECRET_STORE")
 	secretCount := cast.ToInt(os.Getenv("NUM_SECRETS"))
 
 	if secretCount < 1 {
-		log.Fatal("missing or invalid env var: num_secrets")
+		return fmt.Errorf("authcreds package: missing or invalid env var: num_secrets")
 	}
-	url = os.Getenv("TOKEN_URL")
+
+	url := os.Getenv("TOKEN_URL")
 	if url == "" {
-		log.Fatal("missing env var: token_url")
+		return fmt.Errorf("authcreds package: missing env var: token_url")
 	}
+	tokenField := os.Getenv("TOKEN_FIELD")
+	if tokenField == "" {
+		return fmt.Errorf("authcreds package: missing env var: token_field")
+	}
+
 	switch secretLocation {
 	case "GCP":
 		projectID = os.Getenv("PROJECT_ID")
-		switch secretCount {
-		case 1:
-			secret0ID = os.Getenv("SECRET_ID_1")
-			secret0Version = os.Getenv("SECRET_VERSION_1")
-			secret0, err := fetchGCPSecret(projectID, secret0ID, secret0Version)
-			if err != nil {
-				log.Fatalf("error retrieving %v/version/%v: %v", secret0ID, secret0Version, err)
+		for i := 0; i < int(secretCount); i++ {
+			var err error
+			s := new(Secret)
+			s.SecretID = os.Getenv("SECRET_ID_" + cast.ToString(i))
+			if s.SecretID == "" {
+				return fmt.Errorf("authcreds: missing secret_id")
 			}
-			go auth(url, secret0)
-			go auth2(url, secret0)
-		case 2:
-			secret0ID = os.Getenv("SECRET_ID_1")
-			secret0Version = os.Getenv("SECRET_VERSION_1")
-			secret1ID = os.Getenv("SECRET_ID_2")
-			secret1Version = os.Getenv("SECRET_VERSION_2")
-			secret0, err := fetchGCPSecret(projectID, secret0ID, secret0Version)
-			if err != nil {
-				log.Fatalf("error retrieving %v/version/%v: %v", secret0ID, secret0Version, err)
+			s.SecretVersion = os.Getenv("SECRET_VERSION_" + cast.ToString(i))
+			if s.SecretVersion == "" {
+				s.SecretVersion = "1"
 			}
-			secret1, err := fetchGCPSecret(projectID, secret1ID, secret1Version)
-			if err != nil {
-				log.Fatalf("error retrieving %v/version/%v: %v", secret1ID, secret1Version, err)
+			s.url = os.Getenv("TOKEN_URL_" + cast.ToString(i))
+			if url == "" {
+				return fmt.Errorf("authcreds package: missing env var: token_url")
 			}
-			go auth(url, secret0)
-			go auth2(url, secret0)
-			MailCreds.Store(string(secret1))
+			s.TokenField = os.Getenv("TOKEN_FIELD_" + cast.ToString(i))
+			if s.TokenField == "" {
+				s.TokenField = "access_token"
+			}
+			s.TokenType = os.Getenv("TOKEN_TYPE_" + cast.ToString(i))
+			if s.TokenType == "" {
+				s.TokenType = "Bearer"
+			} else {
+				s.TokenType = "APIKEY"
+			}
+			s.token, err = fetchGCPSecret(projectID, s.SecretID, s.SecretVersion)
+			if err != nil {
+				return fmt.Errorf("authcreds: error retrieving %v/version/%v: %v", s.SecretID, s.SecretVersion, err)
+			}
+			Keyring = append(Keyring, *s)
+		}
+		for i := 0; i < len(Keyring); i++ {
+			if Keyring[i].TokenType == "Bearer" {
+				go authBearer(Keyring, i, "")
+				go authBearer(Keyring, i, "30s")
+			} else {
+				Keyring[i].APIToken = Keyring[i].token
+			}
+			if i+1 == 2 {
+				MailCreds.Store(string(Keyring[i].token))
+			}
 		}
 	case "AWS":
 		switch secretCount {
@@ -92,29 +125,30 @@ func AuthLoad() {
 			secret0ID = os.Getenv("SECRET_ID_1")
 			secret0, err := fetchAWSSecret("AWS_SECRET_ID_1")
 			if err != nil {
-				log.Fatal("error retrieving AWS secret %v: %v", secret0ID, err)
+				return fmt.Errorf("error retrieving AWS secret %v: %v", secret0ID, err)
 			}
-			go auth(url, []byte(secret0))
-			go auth2(url, []byte(secret0))
+			go auth(url, tokenField, []byte(secret0))
+			go auth2(url, tokenField, []byte(secret0))
 		case 2:
 			secret0ID = os.Getenv("SECRET_ID_1")
 			secret0, err := fetchAWSSecret("AWS_SECRET_ID_1")
 			if err != nil {
-				log.Fatal("error retrieving AWS secret %v: %v", secret0ID, err)
+				return fmt.Errorf("error retrieving AWS secret %v: %v", secret0ID, err)
 			}
 			secret1ID = os.Getenv("SECRET_ID_2")
 			secret1, err := fetchAWSSecret("AWS_SECRET_ID_2")
 			if err != nil {
-				log.Fatal("error retrieving AWS secret %v: %v", secret1ID, err)
+				return fmt.Errorf("error retrieving AWS secret %v: %v", secret1ID, err)
 			}
-			go auth(url, []byte(secret0))
-			go auth2(url, []byte(secret0))
+			go auth(url, tokenField, []byte(secret0))
+			go auth2(url, tokenField, []byte(secret0))
 			MailCreds.Store(string(secret1))
 		}
 		secret0ID = os.Getenv("SECRET_ID_1")
 		secret1ID = os.Getenv("SECRET_ID_2")
 
 	}
+	return nil
 }
 
 func fetchAWSSecret(secretID string) (string, error) {
@@ -144,7 +178,7 @@ func fetchGCPSecret(projectID, secretID, secretVersion string) ([]byte, error) {
 	return result.Payload.Data, nil
 }
 
-func auth(url string, secret []byte) {
+func auth(url, tokenField string, secret []byte) {
 	payload := strings.NewReader(string(secret))
 	req, err := retryablehttp.NewRequest("POST", url, payload)
 	if err != nil {
@@ -170,14 +204,14 @@ func auth(url string, secret []byte) {
 		}
 		res.Body.Close()
 		jsonbody := string(body)
-		BearerToken.Store("Bearer " + gjson.Get(jsonbody, "access_token").Str)
+		BearerToken.Store("Bearer " + gjson.Get(jsonbody, tokenField).Str)
 		expiry = gjson.Get(jsonbody, "expires_in").Int()
 		d := time.Duration(expiry)
 		time.Sleep(d * time.Second)
 	}
 }
 
-func auth2(url string, secret []byte) {
+func auth2(url, tokenField string, secret []byte) {
 	payload := strings.NewReader(string(secret))
 	req, err := retryablehttp.NewRequest("POST", url, payload)
 	if err != nil {
@@ -204,7 +238,42 @@ func auth2(url string, secret []byte) {
 		}
 		res.Body.Close()
 		jsonbody := string(body)
-		BearerToken.Store("Bearer " + gjson.Get(jsonbody, "access_token").Str)
+		BearerToken.Store("Bearer " + gjson.Get(jsonbody, tokenField).Str)
+		expiry = gjson.Get(jsonbody, "expires_in").Int()
+		d := time.Duration(expiry)
+		time.Sleep(d * time.Second)
+	}
+}
+
+func authBearer(Keyring []Secret, index int, overlap string) {
+	s := Keyring[index]
+	payload := strings.NewReader(string(s.token))
+	req, err := retryablehttp.NewRequest("POST", s.url, payload)
+	if err != nil {
+		log.Println(err)
+	}
+	retryClient := retryablehttp.NewClient()
+	retryClient.RetryMax = 2
+	retryClient.RetryWaitMin = 10000000
+	retryClient.Logger = nil
+
+	req.Header.Add("Content-Type", "application/json")
+	req.Header.Add("Cache-Control", "no-cache")
+	var expiry int64
+	time.Sleep(cast.ToDuration(overlap))
+	for {
+		res, err := retryClient.Do(req)
+		if err != nil {
+			log.Println(err)
+		}
+
+		body, err := ioutil.ReadAll(res.Body)
+		if err != nil {
+			log.Println(err)
+		}
+		res.Body.Close()
+		jsonbody := string(body)
+		BearerToken.Store("Bearer " + gjson.Get(jsonbody, s.TokenField).Str)
 		expiry = gjson.Get(jsonbody, "expires_in").Int()
 		d := time.Duration(expiry)
 		time.Sleep(d * time.Second)
