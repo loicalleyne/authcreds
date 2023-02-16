@@ -113,7 +113,7 @@ func AuthLoad() error {
 				go authBearer(Keyring, i, "")
 				go authBearer(Keyring, i, "30s")
 			} else {
-				Keyring[i].APIToken = Keyring[i].token
+				Keyring[i].APIToken.Store(string(Keyring[i].token))
 			}
 			if i+1 == 2 {
 				MailCreds.Store(string(Keyring[i].token))
